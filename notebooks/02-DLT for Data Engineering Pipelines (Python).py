@@ -92,7 +92,7 @@ def data_raw_lending_club_raw():
 # COMMAND ----------
 
 """
-State table for valid grades
+Deduplicated lending club data
 """
 
 @dlt.create_table(name="lending_club_cleaned",
@@ -150,6 +150,89 @@ def data_raw_GradeA():
 
 def data_raw_GradeB():          
   return (dlt.read_stream("lending_club_cleaned").where("grade=='B'"))
+
+# COMMAND ----------
+
+# DBTITLE 1,Apply Changes - SCD Type 1 or 2
+"""
+Apply changes with history into a dimension table
+"""
+from pyspark.sql.functions import col, expr
+
+
+@dlt.create_table(name="unique_loanees", 
+      schema="""
+        sk_member_id BIGINT GENERATED ALWAYS AS IDENTITY COMMENT 'Surrogate key for Loanee',
+        emp_title string,
+        zip_code string,
+        addr_state string
+      """)
+def unique_loanees():
+  return dlt.read("lending_club_cleaned").select("emp_title", "zip_code", "addr_state").distinct()
+      
+@dlt.create_view(name="loanee_details")
+def loanees():
+  df_detail = dlt.read("unique_loanees")
+  
+  df = dlt.read_stream("lending_club_cleaned").join(
+      df_detail, 
+      ["emp_title", "zip_code", "addr_state"]
+    )
+  return df.select(
+    "sk_member_id",
+    "emp_title",
+    "emp_length",
+    "home_ownership",
+    "annual_inc",
+    "zip_code",
+    "addr_state",
+    "dti",
+    "delinq_2yrs",
+    "earliest_cr_line",
+    "annual_inc_joint",
+    "dti_joint",
+    "verification_status_joint",
+    "issue_d",
+
+    # "last_fico_range_high",
+    # "last_fico_range_low"
+    
+  ).distinct()
+  # .join(
+    # dlt.table("loanees"), ["emp_title, zip_code, addr_state"], how="left anti")
+
+dlt.create_streaming_table(name="dim_loanees",                    
+        comment="Gold dimension table for loanees.",
+        schema="""sk_loanee_id BIGINT GENERATED ALWAYS AS IDENTITY COMMENT 'Surrogate key for SCD 2 dimension',
+        sk_member_id BIGINT,
+        emp_title string,
+        emp_length string,
+        home_ownership string,
+        annual_inc float,
+        zip_code string,
+        addr_state string,
+        dti float,
+        delinq_2yrs float,
+        earliest_cr_line timestamp,
+        annual_inc_joint string,
+        dti_joint double,
+        verification_status_joint string,
+        __START_AT timestamp,
+        __END_AT timestamp""",
+
+)
+
+dlt.apply_changes(
+        "dim_loanees",
+        "loanee_details", 
+        ["sk_member_id"], 
+        sequence_by=col("issue_d"),
+        except_column_list = ["issue_d"],
+        stored_as_scd_type = "2"
+)
+
+# apply_as_deletes = expr("operation = 'DELETE'"),
+
 
 # COMMAND ----------
 
@@ -229,11 +312,29 @@ def top_loanees_CA():
 Unify cleaned and preprocessed delta live tables
 """
 
-@dlt.table(name=f"all_Top_lonees",
+@dlt.table(name=f"all_Top_loanees",
   comment="A table containing all the top lonees with both grade A and B."
 )
 
-def all_top_lonees():
+def all_top_loanees():
     return (dlt.read(f"TopLoanees_{inputData1}")
         .union(dlt.read(f"TopLoanees_{inputData2}"))
     )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View event log with SQL
+# MAGIC You can see progress in the UI by reviewing the event log, but you also have the option to query it using SQL statements.  
+# MAGIC
+# MAGIC If using Hive Metastore, view the log based on directory:  
+# MAGIC 1. Query delta table at by replacing {storage_location} with your pipelines storage location:  
+# MAGIC   SELECT * FROM delta.`{storage_location}/system/events`
+# MAGIC
+# MAGIC If using Unity Catalog, view the log with one of these options:  
+# MAGIC 1. Query by pipeline ID (replace with your own):
+# MAGIC   SELECT * FROM event_log("0aca8c3a-e4ea-4710-b3fb-43b799eccc8c")
+# MAGIC 1. Query based on a table in the pipeline:  
+# MAGIC   SELECT * FROM event_log(TABLE(my_catalog.my_schema.table1))
+# MAGIC
+# MAGIC [DLT Observability doc](https://docs.databricks.com/en/delta-live-tables/observability.html)
